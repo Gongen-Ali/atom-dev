@@ -58,6 +58,25 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
+
+# TileLang decode backend: lazy import to avoid TVM/HIP runtime init in ATOM
+# subprocess workers (causes SIGFPE during model loading).
+_tilelang_decode_fn = None
+_tilelang_decode_checked = False
+
+
+def _get_tilelang_decode_fn():
+    global _tilelang_decode_fn, _tilelang_decode_checked
+    if not _tilelang_decode_checked:
+        _tilelang_decode_checked = True
+        try:
+            from atom.model_ops.v4_kernels.paged_decode_8warp_v4_splitk import (
+                sparse_attn_v4_paged_decode_tilelang_splitk,
+            )
+            _tilelang_decode_fn = sparse_attn_v4_paged_decode_tilelang_splitk
+        except Exception:
+            _tilelang_decode_fn = None
+    return _tilelang_decode_fn
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
@@ -902,6 +921,74 @@ def sparse_attn_v4_paged_decode_reference(
     return _sparse_attn_ragged_torch(q, unified_kv, attn_sink, topk_idxs, softmax_scale)
 
 
+
+# --- dump decode inputs for offline benchmarking ---
+_decode_dump_count = 0
+_decode_call_count = 0
+
+
+def _should_dump_decode(q):
+    """Check if this decode call should be dumped based on env filters."""
+    global _decode_call_count
+    _decode_call_count += 1
+
+    # Only dump when explicitly enabled
+    if os.environ.get("ATOM_DUMP_DECODE", "0") != "1":
+        return False
+
+    # Cannot dump during CUDAGraph capture (.cpu() would fail)
+    if torch.cuda.is_current_stream_capturing():
+        return False
+
+    # skip first N calls (warmup)
+    skip = int(os.environ.get("ATOM_DUMP_DECODE_SKIP", "0"))
+    if _decode_call_count <= skip:
+        return False
+
+    # minimum token threshold (filter CUDAGraph capture warmup with small T)
+    min_t = int(os.environ.get("ATOM_DUMP_DECODE_MIN_T", "8"))
+    if q.shape[0] < min_t:
+        return False
+
+    # max dumps
+    max_dumps = int(os.environ.get("ATOM_DUMP_DECODE_MAX", "10"))
+    if _decode_dump_count >= max_dumps:
+        return False
+
+    return True
+
+
+def _save_decode_inputs(q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale):
+    """Save decode inputs to a .pt file for offline benchmarking."""
+    global _decode_dump_count
+    dump_dir = os.environ.get(
+        "ATOM_DUMP_DECODE_DIR", "/home/gongen.ge/ATOM/decode_inputs"
+    )
+    os.makedirs(dump_dir, exist_ok=True)
+
+    T, H, D = q.shape
+    kv_n = kv_indices.numel()
+    filename = f"decode_T{T}_H{H}_D{D}_kv{kv_n}.pt"
+    file_path = os.path.join(dump_dir, filename)
+
+    torch.save(
+        {
+            "q": q.detach().cpu(),
+            "unified_kv": unified_kv.detach().cpu(),
+            "kv_indices": kv_indices.detach().cpu(),
+            "kv_indptr": kv_indptr.detach().cpu(),
+            "attn_sink": attn_sink.detach().cpu(),
+            "softmax_scale": softmax_scale,
+        },
+        file_path,
+    )
+    _decode_dump_count += 1
+    print(
+        f"[decode_dump #{_decode_dump_count}] saved to {file_path}  "
+        f"(call#{_decode_call_count} T={T}, H={H}, D={D}, kv_n={kv_n})"
+    )
+
+
 def sparse_attn_v4_paged_decode(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -916,6 +1003,25 @@ def sparse_attn_v4_paged_decode(
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
+    # --- dump inputs for offline benchmarking ---
+    if _should_dump_decode(q):
+        _save_decode_inputs(q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale)
+
+    # TileLang backend (lazy-loaded, try first)
+    _fn = _get_tilelang_decode_fn()
+    if _fn is not None and kv_scales is None:
+        try:
+            return _fn(
+                q,
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+            )
+        except Exception:
+            pass
+
     if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
         return _sparse_attn_v4_paged_decode_triton(
             q,

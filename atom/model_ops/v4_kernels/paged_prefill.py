@@ -44,11 +44,32 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from atom.utils import envs
+
+# TileLang backend: lazy import to avoid TVM/ HIP runtime init in ATOM
+# subprocess workers (causes SIGFPE during model loading).
+_tilelang_fn = None
+_tilelang_checked = False
+
+
+def _get_tilelang_fn():
+    global _tilelang_fn, _tilelang_checked
+    if not _tilelang_checked:
+        _tilelang_checked = True
+        try:
+            from atom.model_ops.v4_kernels.paged_prefill_8warp_splitk import (
+                sparse_attn_v4_paged_prefill_tilelang_8warp_splitk,
+            )
+            _tilelang_fn = sparse_attn_v4_paged_prefill_tilelang_8warp_splitk
+        except Exception:
+            _tilelang_fn = None
+    return _tilelang_fn
 
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
@@ -338,6 +359,74 @@ def sparse_attn_v4_paged_prefill_reference(
     return _sparse_attn_ragged_torch(q, pool, attn_sink, topk_idxs, softmax_scale)
 
 
+# --- dump prefill inputs for offline benchmarking ---
+_prefill_dump_count = 0  # tracks how many times dump was triggered
+_prefill_call_count = 0  # tracks total prefill calls
+
+
+def _should_dump_prefill(q):
+    """Check if this prefill call should be dumped based on env filters."""
+    global _prefill_call_count
+    _prefill_call_count += 1
+
+    # skip first N calls (warmup / small batches)
+    skip = int(os.environ.get("ATOM_DUMP_PREFILL_SKIP", "0"))
+    if _prefill_call_count <= skip:
+        return False
+
+    # minimum token threshold
+    min_t = int(os.environ.get("ATOM_DUMP_PREFILL_MIN_T", "100"))
+    if q.shape[0] < min_t:
+        return False
+
+    # max dumps (stop after N saves)
+    max_dumps = int(os.environ.get("ATOM_DUMP_PREFILL_MAX", "10"))
+    if _prefill_dump_count >= max_dumps:
+        return False
+
+    return True
+
+
+def _save_prefill_inputs(
+    q, unified_kv, kv_indices_prefix, kv_indptr_prefix,
+    kv, kv_indices_extend, kv_indptr_extend, attn_sink,
+    softmax_scale,
+):
+    """Save prefill inputs to a .pt file for offline benchmarking."""
+    global _prefill_dump_count
+    dump_dir = os.environ.get(
+        "ATOM_DUMP_PREFILL_DIR", "/home/gongen.ge/ATOM/prefill_inputs"
+    )
+    os.makedirs(dump_dir, exist_ok=True)
+
+    T, H, D = q.shape
+    prefix_n = kv_indices_prefix.numel()
+    extend_n = kv_indices_extend.numel()
+    filename = f"prefill_T{T}_H{H}_D{D}_pfx{prefix_n}_ext{extend_n}.pt"
+    path = os.path.join(dump_dir, filename)
+
+    torch.save(
+        {
+            "q": q.detach().cpu(),
+            "unified_kv": unified_kv.detach().cpu(),
+            "kv_indices_prefix": kv_indices_prefix.detach().cpu(),
+            "kv_indptr_prefix": kv_indptr_prefix.detach().cpu(),
+            "kv": kv.detach().cpu(),
+            "kv_indices_extend": kv_indices_extend.detach().cpu(),
+            "kv_indptr_extend": kv_indptr_extend.detach().cpu(),
+            "attn_sink": attn_sink.detach().cpu(),
+            "softmax_scale": softmax_scale,
+        },
+        path,
+    )
+    _prefill_dump_count += 1
+    print(
+        f"[prefill_dump #{_prefill_dump_count}] saved to {path}  "
+        f"(call#{_prefill_call_count} T={T}, H={H}, D={D}, "
+        f"prefix={prefix_n}, extend={extend_n})"
+    )
+
+
 def sparse_attn_v4_paged_prefill(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -385,6 +474,23 @@ def sparse_attn_v4_paged_prefill(
                 softmax_scale,
             )
         except RuntimeError:
+            pass
+    _fn = _get_tilelang_fn()
+    if _fn is not None:
+        try:
+            return _fn(
+                q,
+                unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                kv,
+                kv_indices_extend,
+                kv_indptr_extend,
+                attn_sink,
+                softmax_scale,
+            )
+        except Exception:
+            print("TILELANG FAILED")
             pass
     return _sparse_attn_v4_paged_prefill_triton(
         q,

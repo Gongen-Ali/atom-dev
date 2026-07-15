@@ -57,3 +57,7 @@ online_quant_info_*.json
 
 # CI: Docker client config (DOCKER_CONFIG) under workspace for atom-vllm-oot
 .atom-docker-client/
+
+# >2GB data files (use external storage)
+prefill_inputs/prefill_T712_H16_D512_pfx7744_ext32040.pt
+decode_inputs/decode_T32_H16_D512_kv3648.pt
