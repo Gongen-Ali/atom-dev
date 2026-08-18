@@ -349,11 +349,7 @@ body {
 }
 .lucky .luck-star { color: #F6C86A; font-size: 13px; flex-shrink: 0; padding-right: 4px; }
 
-/* 像素手绘冒号（保证渲染为“：”而不是“；”） */
-.pcolon { display: inline-block; width: 3px; height: 14px; position: relative; vertical-align: middle; margin: 0 5px; }
-.pcolon::before, .pcolon::after { content: ""; position: absolute; left: 0; width: 3px; height: 3px; background: currentColor; }
-.pcolon::before { top: 2px; }
-.pcolon::after { top: 8px; }
+/* 注：Zpix 字体将全角“：”与“；”的字形画反了，故幸运词用半角“:” */
 
 /* 标题区点缀装饰 */
 .title-deco { position: absolute; inset: 0; z-index: -1; pointer-events: none; }
@@ -546,7 +542,7 @@ body {
       <!-- 幸运词 -->
       <div class="lucky">
         <span class="heart-box"><span class="heart-pixel" data-icon="heart"></span></span>
-        <div class="text">幸运词<i class="pcolon"></i><span contenteditable="true">中国人能飞！</span></div>
+        <div class="text" contenteditable="true">幸运词:中国人能飞！</div>
         <span class="luck-star">✦</span>
       </div>
     </div>
