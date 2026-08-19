@@ -36,11 +36,12 @@ body {
   justify-content: center;
 }
 
-/* ========== 手机外框 ========== */
+/* ========== 手机外框（固定 3:4 竖版比例） ========== */
 .phone {
   position: relative;
-  width: min(420px, 100vw);
-  max-height: 100vh;
+  width: min(96vw, 448px);
+  aspect-ratio: 3 / 4;      /* 宽:高 = 3:4 */
+  max-height: 98vh;
   background: #000;
   overflow: hidden;
   box-shadow: 0 0 60px rgba(0,0,0,.8);
